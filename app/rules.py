@@ -217,19 +217,24 @@ def match_orders_with_price(
     buy_orders: List[dict]
 ) -> List[OrderMatchResult]:
     """
-    带价格的挂单撮合：
-    - 卖单按价格从低到高排序（先卖便宜的）
-    - 买单按价格从高到低排序（先买贵的）
+    带价格的挂单撮合（价格优先、时间优先）：
+    - 卖单按价格从低到高排序（先卖便宜的），同价位按挂单时间从早到晚（再按订单ID）
+    - 买单按价格从高到低排序（先买贵的），同价位按挂单时间从早到晚（再按订单ID）
     - 当买单价格 >= 卖单价格时可以成交，成交价取两者均价
+
+    时间优先保证早挂单的可售额度/资金先被消费，部分成交按此确定顺序分配，
+    不会因并发请求的调度顺序不同而产生不同结果（排序是纯函数、确定性的）。
     """
+    from datetime import datetime as _dt
+    earliest = _dt.min
+
     sell_orders_sorted = sorted(
         [o for o in sell_orders if o["remaining_amount"] > 0.01],
-        key=lambda x: x["unit_price"]
+        key=lambda x: (x["unit_price"], x.get("created_at", earliest), x["id"])
     )
     buy_orders_sorted = sorted(
         [o for o in buy_orders if o["remaining_amount"] > 0.01],
-        key=lambda x: x["unit_price"],
-        reverse=True
+        key=lambda x: (-x["unit_price"], x.get("created_at", earliest), x["id"])
     )
 
     results = []

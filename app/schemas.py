@@ -2,7 +2,11 @@ from typing import List, Optional
 from datetime import datetime
 from pydantic import BaseModel, Field
 
-from .models import CreditRecordStatus, OrderType, OrderStatus, CarryoverStatus
+from .models import (
+    CreditRecordStatus, OrderType, OrderStatus, CarryoverStatus,
+    BatchStatus, AuthorizationStatus, ExecutionStatus, LegStatus,
+    OutboxTaskType, OutboxTaskStatus,
+)
 
 
 class EnterpriseBase(BaseModel):
@@ -268,7 +272,9 @@ class CreditOrderBase(BaseModel):
 
 
 class CreditOrderCreate(CreditOrderBase):
-    pass
+    credit_batch_ids: Optional[List[int]] = Field(
+        None, description="卖单指定冻结的积分批次；不传则按FIFO自动选择"
+    )
 
 
 class CreditOrderUpdate(BaseModel):
@@ -284,6 +290,8 @@ class CreditOrder(CreditOrderBase):
     filled_amount: float
     remaining_amount: float
     status: OrderStatus
+    authorized_amount: float = Field(0.0, description="已预授权冻结的总数量（积分/资金对应的积分额度）")
+    released_amount: float = Field(0.0, description="撤单/过期已释放数量")
     created_at: datetime
     updated_at: datetime
 
@@ -295,6 +303,11 @@ class CreditOrderWithDetail(CreditOrder):
     enterprise: Enterprise
     sell_transactions: List["CreditTransaction"] = []
     buy_transactions: List["CreditTransaction"] = []
+    authorizations: List["OrderAuthorizationOut"] = []
+    # 五段数量口径，便于查询时直接区分
+    matched_unsettled_amount: float = 0.0
+    settled_amount: float = 0.0
+    held_amount: float = 0.0
 
     class Config:
         from_attributes = True
@@ -304,6 +317,158 @@ class CreditOrderMatchRequest(BaseModel):
     buy_order_id: int
     sell_order_id: int
     credit_amount: float
+    idempotency_key: Optional[str] = Field(None, max_length=64, description="客户端幂等键；同键重放返回首次结果")
+
+
+class CreditBatchCreate(BaseModel):
+    enterprise_id: int
+    year: int
+    total_amount: float = Field(..., gt=0, description="批次可售积分总量")
+    remark: Optional[str] = None
+
+
+class CreditBatch(BaseModel):
+    id: int
+    batch_no: str
+    enterprise_id: int
+    year: int
+    total_amount: float
+    frozen_amount: float = Field(..., description="被卖单预授权冻结数量")
+    consumed_amount: float = Field(..., description="已成交消费数量")
+    available_amount: float = Field(..., description="可用=总-冻结-已消费")
+    status: BatchStatus
+    remark: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class FundsAccountDeposit(BaseModel):
+    amount: float = Field(..., gt=0, description="入账金额(元)")
+
+
+class FundsAccount(BaseModel):
+    id: int
+    enterprise_id: int
+    currency: str
+    balance: float = Field(..., description="可用资金")
+    frozen_amount: float = Field(..., description="买单预授权冻结资金")
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class OrderAuthorizationOut(BaseModel):
+    id: int
+    auth_no: str
+    order_id: int
+    enterprise_id: int
+    side: OrderType
+    batch_id: Optional[int] = None
+    funds_account_id: Optional[int] = None
+    amount: float = Field(..., description="本行冻结数量（卖单为积分，买单为资金元）")
+    consumed_amount: float
+    released_amount: float
+    held_amount: float = Field(..., description="仍冻结=amount-consumed-released")
+    status: AuthorizationStatus
+    expires_at: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class CreditTradeLegOut(BaseModel):
+    id: int
+    execution_id: int
+    seq: int
+    sell_order_id: int
+    buy_order_id: int
+    credit_amount: float
+    matched_price: float
+    total_amount: float
+    status: LegStatus
+    transaction_id: Optional[int] = None
+    created_at: datetime
+    settled_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class TradeExecutionOut(BaseModel):
+    id: int
+    execution_no: str
+    idempotency_key: Optional[str] = None
+    year: int
+    trigger_type: str
+    sell_order_id: Optional[int] = None
+    buy_order_id: Optional[int] = None
+    status: ExecutionStatus
+    planned_count: int
+    settled_count: int
+    failed_count: int
+    total_credit_amount: float
+    total_cash_amount: float
+    error_detail: Optional[str] = None
+    legs: List[CreditTradeLegOut] = []
+    created_at: datetime
+    committed_at: Optional[datetime] = None
+    settled_at: Optional[datetime] = None
+
+    class Config:
+        from_attributes = True
+
+
+class MatchPairResponse(BaseModel):
+    replayed: bool = Field(..., description="是否命中幂等键的重复/重放请求")
+    execution: TradeExecutionOut
+
+
+class MatchAutoResponse(BaseModel):
+    success: bool
+    message: str
+    execution: Optional[TradeExecutionOut] = None
+
+
+class OutboxTaskOut(BaseModel):
+    id: int
+    task_type: OutboxTaskType
+    execution_id: Optional[int] = None
+    status: OutboxTaskStatus
+    attempts: int
+    max_attempts: int
+    last_error: Optional[str] = None
+    locked_by: Optional[str] = None
+    available_at: datetime
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class OrderQuantityBreakdown(BaseModel):
+    """挂单五段口径查询：挂单/预授权/成交/清算/释放数量各不相同。"""
+    model_config = {"protected_namespaces": ()}
+
+    order_id: int
+    order_no: str
+    side: OrderType
+    status: OrderStatus
+    posted_amount: float = Field(..., description="挂单总数量")
+    filled_amount: float = Field(..., description="已成交=已清算+已成交未清算")
+    remaining_amount: float = Field(..., description="挂单剩余可成交数量")
+    authorized_amount: float = Field(..., description="预授权累计冻结数量")
+    held_amount: float = Field(..., description="当前仍被预授权冻结数量")
+    matched_unsettled_amount: float = Field(..., description="已成交未清算数量")
+    settled_amount: float = Field(..., description="已清算数量")
+    released_amount: float = Field(..., description="撤单/过期释放数量")
+    authorizations: List[OrderAuthorizationOut] = []
 
 
 class MatchWithOrdersResponse(BaseModel):

@@ -3,7 +3,7 @@ from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 from sqlalchemy import func, and_, or_
 
-from . import models, schemas
+from . import models, schemas, matching
 from .rules import (
     calculate_power_consumption_limit,
     calculate_unit_credit,
@@ -11,7 +11,6 @@ from .rules import (
     detect_weight_manipulation,
     EnterpriseCreditSummary,
     match_credit_transactions,
-    match_orders_with_price,
     calculate_carryover_amount,
     calculate_chain_carryover_amount,
     validate_order_price,
@@ -540,39 +539,154 @@ def generate_carryover_no(db: Session) -> str:
 def create_credit_order(
     db: Session, order: schemas.CreditOrderCreate
 ) -> Optional[models.CreditOrder]:
-    is_valid, error_msg = validate_order_price(order.unit_price)
-    if not is_valid:
-        raise ValueError(error_msg)
+    """
+    挂单（成交前预授权）。
 
-    enterprise = get_enterprise(db, order.enterprise_id)
-    if not enterprise:
-        raise ValueError("企业不存在")
-
-    if order.order_type == OrderType.SELL:
-        summary = calculate_enterprise_credit_summary_v2(
-            db, order.enterprise_id, order.year
-        )
-        if summary and order.total_amount > summary.final_credit_surplus:
-            raise ValueError("挂单数量超过可出售的积分钟余")
-
-    order_no = generate_order_no(db)
-    expires_at = order.expires_at or (datetime.now() + timedelta(days=90))
-
-    db_order = models.CreditOrder(
-        **order.model_dump(exclude={"expires_at"}),
-        order_no=order_no,
-        filled_amount=0.0,
-        remaining_amount=order.total_amount,
-        expires_at=expires_at
-    )
-    db.add(db_order)
-    db.commit()
-    db.refresh(db_order)
-    return db_order
+    历史调用方直接传入 Session：挂单流程内部需要数据库级写锁串行化，
+    因此这里改用 matching 引擎并忽略传入的 db（其事务尚未持锁），
+    由引擎在 BEGIN IMMEDIATE 内重新打开会话完成冻结并提交；
+    提交后用调用方 Session 重新查询返回绑定实例，避免 DetachedInstance。
+    """
+    order = matching.create_order(order, credit_batch_ids=order.credit_batch_ids)
+    # 引擎在独立写锁会话提交；本调用方 Session 身份映射中的批次/账户等
+    # 实例已过期，统一 expire 后再读才能拿到冻结后的最新状态
+    db.expire_all()
+    return db.query(models.CreditOrder).filter(models.CreditOrder.id == order.id).first()
 
 
 def get_credit_order(db: Session, order_id: int) -> Optional[models.CreditOrder]:
     return db.query(models.CreditOrder).filter(models.CreditOrder.id == order_id).first()
+
+
+# ---------------------------------------------------------------------------
+# 成交前预授权：资金账户 / 积分批次 / 授权 / 执行计划 / 任务箱
+# ---------------------------------------------------------------------------
+
+def create_funds_account_if_absent(
+    db: Session, enterprise_id: int, initial_balance: float = 0.0
+) -> models.FundsAccount:
+    """供初始化/管理端使用：账户已存在则直接返回，不重复入账。"""
+    existing = db.query(models.FundsAccount).filter(
+        models.FundsAccount.enterprise_id == enterprise_id
+    ).first()
+    if existing:
+        return existing
+    account = matching.create_funds_account(db, enterprise_id, initial_balance)
+    db.commit()
+    db.refresh(account)
+    return account
+
+
+def deposit_funds_account(db: Session, enterprise_id: int, amount: float) -> models.FundsAccount:
+    account = matching.deposit_funds_account(db, enterprise_id, amount)
+    db.commit()
+    db.refresh(account)
+    return account
+
+
+def get_funds_account(db: Session, enterprise_id: int) -> Optional[models.FundsAccount]:
+    return db.query(models.FundsAccount).filter(
+        models.FundsAccount.enterprise_id == enterprise_id
+    ).first()
+
+
+def create_credit_batch(
+    db: Session, enterprise_id: int, year: int, total_amount: float,
+    remark: Optional[str] = None
+) -> models.CreditBatch:
+    batch = matching.create_credit_batch(db, enterprise_id, year, total_amount, remark)
+    db.commit()
+    db.refresh(batch)
+    return batch
+
+
+def get_credit_batches(
+    db: Session, enterprise_id: Optional[int] = None, year: Optional[int] = None,
+    skip: int = 0, limit: int = 100
+) -> List[models.CreditBatch]:
+    query = db.query(models.CreditBatch)
+    if enterprise_id:
+        query = query.filter(models.CreditBatch.enterprise_id == enterprise_id)
+    if year:
+        query = query.filter(models.CreditBatch.year == year)
+    return query.order_by(models.CreditBatch.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def get_order_authorizations(
+    db: Session, order_id: Optional[int] = None,
+    enterprise_id: Optional[int] = None,
+    side: Optional[OrderType] = None,
+    status: Optional[models.AuthorizationStatus] = None,
+    skip: int = 0, limit: int = 100
+) -> List[models.OrderAuthorization]:
+    query = db.query(models.OrderAuthorization)
+    if order_id:
+        query = query.filter(models.OrderAuthorization.order_id == order_id)
+    if enterprise_id:
+        query = query.filter(models.OrderAuthorization.enterprise_id == enterprise_id)
+    if side:
+        query = query.filter(models.OrderAuthorization.side == side)
+    if status:
+        query = query.filter(models.OrderAuthorization.status == status)
+    return query.order_by(models.OrderAuthorization.created_at.desc()).offset(skip).limit(limit).all()
+
+
+def get_trade_execution(db: Session, execution_id: int) -> Optional[models.TradeExecution]:
+    return db.get(models.TradeExecution, execution_id)
+
+
+def get_order_quantity_breakdown(db: Session, order_id: int) -> Optional[schemas.OrderQuantityBreakdown]:
+    """五段口径：挂单/预授权/成交(未清算)/清算/释放，数量分别可查、可解释。"""
+    # 撮合/撤单/过期可能在独立写锁会话提交；先丢弃本会话旧快照
+    db.expire_all()
+    order = get_credit_order(db, order_id)
+    if not order:
+        return None
+
+    auths = get_order_authorizations(db, order_id=order_id)
+    held = sum(
+        _authorization_held(a) for a in auths
+    )
+    legs = db.query(models.CreditTradeLeg).filter(
+        or_(models.CreditTradeLeg.sell_order_id == order_id,
+            models.CreditTradeLeg.buy_order_id == order_id)
+    ).all()
+    # 已成交未清算：成交记录仍为 matched（腿可能 MATCHED 或待重试 FAILED，
+    # 二者都属于“成交已落账、清算尚未完成”的可恢复部分结果）
+    txns = db.query(models.CreditTransaction).filter(
+        or_(models.CreditTransaction.sell_order_id == order_id,
+            models.CreditTransaction.buy_order_id == order_id)
+    ).all()
+    matched_unsettled = round(sum(
+        t.credit_amount for t in txns if t.status == "matched"), 2)
+    settled = round(sum(t.credit_amount for t in txns if t.status == "completed"), 2)
+    return schemas.OrderQuantityBreakdown(
+        order_id=order.id,
+        order_no=order.order_no,
+        side=order.order_type,
+        status=order.status,
+        posted_amount=round(order.total_amount + order.released_amount, 2)
+            if False else round(order.total_amount, 2),
+        filled_amount=round(order.filled_amount, 2),
+        remaining_amount=round(order.remaining_amount, 2),
+        authorized_amount=round(order.authorized_amount, 2),
+        held_amount=round(held, 2),
+        matched_unsettled_amount=round(matched_unsettled, 2),
+        settled_amount=round(settled, 2),
+        released_amount=round(order.released_amount, 2),
+        authorizations=[schemas.OrderAuthorizationOut.model_validate(a) for a in auths],
+    )
+
+
+def _authorization_held(auth: models.OrderAuthorization) -> float:
+    if auth.side == OrderType.BUY:
+        return round(auth.amount - auth.consumed_amount - auth.released_amount, 2) / PRICE_CEILING
+    return round(auth.amount - auth.consumed_amount - auth.released_amount, 2)
+
+
+def replay_pending_market_tasks(db: Session, batch_limit: int = 100) -> dict:
+    """重启后任务回放入口（路由层也可定时触发）。"""
+    return matching.replay_pending_tasks(batch_limit=batch_limit)
 
 
 def get_credit_orders(
@@ -599,234 +713,106 @@ def get_credit_orders(
 def update_credit_order(
     db: Session, order_id: int, order_update: schemas.CreditOrderUpdate
 ) -> Optional[models.CreditOrder]:
-    db_order = get_credit_order(db, order_id)
-    if not db_order:
-        return None
-
-    if db_order.status not in [OrderStatus.PENDING, OrderStatus.PARTIAL]:
-        raise ValueError("只有待成交或部分成交的订单可以修改")
-
-    update_data = order_update.model_dump(exclude_unset=True)
-
-    if "unit_price" in update_data:
-        is_valid, error_msg = validate_order_price(update_data["unit_price"])
-        if not is_valid:
-            raise ValueError(error_msg)
-
-    if "total_amount" in update_data:
-        if update_data["total_amount"] < db_order.filled_amount:
-            raise ValueError("挂单总量不能小于已成交数量")
-        db_order.remaining_amount = round(
-            update_data["total_amount"] - db_order.filled_amount, 2
-        )
-
-    for key, value in update_data.items():
-        setattr(db_order, key, value)
-
-    db_order.updated_at = datetime.utcnow()
-    db.commit()
-    db.refresh(db_order)
-    return db_order
+    # 改单涉及授权增减，必须在写锁事务内串行完成；返回时用调用方会话重查绑定实例
+    matching.update_order(order_id, order_update)
+    db.expire_all()
+    return db.query(models.CreditOrder).filter(models.CreditOrder.id == order_id).first()
 
 
 def cancel_credit_order(db: Session, order_id: int) -> Optional[models.CreditOrder]:
-    db_order = get_credit_order(db, order_id)
-    if not db_order:
-        return None
-
-    if db_order.status not in [OrderStatus.PENDING, OrderStatus.PARTIAL]:
-        raise ValueError("只有待成交或部分成交的订单可以取消")
-
-    db_order.status = OrderStatus.CANCELLED
-    db_order.updated_at = datetime.utcnow()
-    db.commit()
-    db.refresh(db_order)
-    return db_order
+    # 撤单释放预授权，同样需要写锁内串行，防止与撮合并发
+    matching.cancel_order(order_id)
+    db.expire_all()
+    return db.query(models.CreditOrder).filter(models.CreditOrder.id == order_id).first()
 
 
 def match_orders_by_id(
     db: Session, match_request: schemas.CreditOrderMatchRequest
 ) -> Tuple[Optional[models.CreditTransaction], Optional[str]]:
-    sell_order = get_credit_order(db, match_request.sell_order_id)
-    buy_order = get_credit_order(db, match_request.buy_order_id)
+    """
+    指定挂单撮合（成交前预授权 + 两阶段成交/清算）。
 
-    if not sell_order or not buy_order:
-        return None, "订单不存在"
+    返回首条已落账成交记录与错误信息；成交可能处于 matched（待清算）或
+    completed（已清算）。清算的具体执行与回放由撮合引擎/任务箱保证。
+    """
+    # 结束调用方会话可能持有的旧只读快照，确保随后读到引擎写锁事务提交后的最新状态
+    db.rollback()
+    try:
+        execution, _replayed = matching.match_pair(
+            sell_order_id=match_request.sell_order_id,
+            buy_order_id=match_request.buy_order_id,
+            credit_amount=match_request.credit_amount,
+            idempotency_key=match_request.idempotency_key,
+            trigger_type="manual",
+            request_payload=match_request.model_dump(),
+        )
+    except ValueError as exc:
+        return None, str(exc)
 
-    if sell_order.order_type != OrderType.SELL:
-        return None, "卖单类型错误"
-    if buy_order.order_type != OrderType.BUY:
-        return None, "买单类型错误"
-
-    if sell_order.status not in [OrderStatus.PENDING, OrderStatus.PARTIAL]:
-        return None, "卖单状态不可交易"
-    if buy_order.status not in [OrderStatus.PENDING, OrderStatus.PARTIAL]:
-        return None, "买单状态不可交易"
-
-    if buy_order.unit_price < sell_order.unit_price:
-        return None, f"买单价格({buy_order.unit_price})低于卖单价格({sell_order.unit_price})，无法成交"
-
-    match_amount = min(
-        match_request.credit_amount,
-        sell_order.remaining_amount,
-        buy_order.remaining_amount
-    )
-    match_amount = round(match_amount, 2)
-
-    if match_amount <= 0.01:
-        return None, "可成交数量不足"
-
-    matched_price = round((sell_order.unit_price + buy_order.unit_price) / 2, 2)
-    total_amount = round(match_amount * matched_price, 2)
-
-    txn_create = schemas.CreditTransactionCreate(
-        from_enterprise_id=sell_order.enterprise_id,
-        to_enterprise_id=buy_order.enterprise_id,
-        credit_amount=match_amount,
-        unit_price=matched_price,
-        total_amount=total_amount,
-        remark=f"挂单交易：卖单{sell_order.order_no} → 买单{buy_order.order_no}"
-    )
-
-    db_txn = models.CreditTransaction(
-        **txn_create.model_dump(),
-        transaction_no=generate_transaction_no(db),
-        sell_order_id=sell_order.id,
-        buy_order_id=buy_order.id,
-        status="completed"
-    )
-    db.add(db_txn)
-
-    sell_order.filled_amount = round(sell_order.filled_amount + match_amount, 2)
-    sell_order.remaining_amount = round(sell_order.remaining_amount - match_amount, 2)
-    sell_order.status = OrderStatus.FILLED if sell_order.remaining_amount <= 0.01 else OrderStatus.PARTIAL
-    sell_order.updated_at = datetime.utcnow()
-
-    buy_order.filled_amount = round(buy_order.filled_amount + match_amount, 2)
-    buy_order.remaining_amount = round(buy_order.remaining_amount - match_amount, 2)
-    buy_order.status = OrderStatus.FILLED if buy_order.remaining_amount <= 0.01 else OrderStatus.PARTIAL
-    buy_order.updated_at = datetime.utcnow()
-
-    create_price_history(db, db_txn, sell_order.year)
-
-    update_annual_summary_after_transaction(db, db_txn, sell_order.year)
-
-    db.commit()
-    db.refresh(db_txn)
-    db.refresh(sell_order)
-    db.refresh(buy_order)
-
-    return db_txn, None
+    txn = db.query(models.CreditTransaction).filter(
+        models.CreditTransaction.sell_order_id == match_request.sell_order_id,
+        models.CreditTransaction.buy_order_id == match_request.buy_order_id,
+    ).order_by(models.CreditTransaction.id).first()
+    if txn is None:
+        return None, "撮合未生成成交记录"
+    return txn, None
 
 
 def match_all_pending_orders(
-    db: Session, year: int
+    db: Session, year: int, idempotency_key: Optional[str] = None
 ) -> Tuple[List[models.CreditTransaction], List[dict], float, float]:
-    pending_sell_orders = get_credit_orders(
-        db, year=year, order_type=OrderType.SELL, status=OrderStatus.PENDING
-    )
-    pending_partial_sell = get_credit_orders(
-        db, year=year, order_type=OrderType.SELL, status=OrderStatus.PARTIAL
-    )
-    all_sell_orders = pending_sell_orders + pending_partial_sell
+    """
+    价格-时间优先的自动连续撮合：整批挂单在一个执行计划内按确定顺序
+    生成多腿成交；撮合原子提交，清算逐腿提交（部分结果可恢复回放）。
+    """
+    # 引擎在独立写锁事务提交；先结束调用方旧快照，返回的汇总才反映最新状态
+    db.rollback()
+    result = matching.match_auto(year, idempotency_key=idempotency_key)
+    if result is None:
+        return [], [], 0.0, 0.0
+    execution_detached, _replayed = result
+    execution = db.get(models.TradeExecution, execution_detached.id)
 
-    pending_buy_orders = get_credit_orders(
-        db, year=year, order_type=OrderType.BUY, status=OrderStatus.PENDING
-    )
-    pending_partial_buy = get_credit_orders(
-        db, year=year, order_type=OrderType.BUY, status=OrderStatus.PARTIAL
-    )
-    all_buy_orders = pending_buy_orders + pending_partial_buy
+    transactions = db.query(models.CreditTransaction).join(
+        models.CreditTradeLeg,
+        models.CreditTradeLeg.transaction_id == models.CreditTransaction.id
+    ).filter(
+        models.CreditTradeLeg.execution_id == execution.id
+    ).order_by(models.CreditTradeLeg.seq).all()
 
-    sell_order_dicts = []
-    for o in all_sell_orders:
-        enterprise = get_enterprise(db, o.enterprise_id)
-        sell_order_dicts.append({
-            "id": o.id,
-            "enterprise_id": o.enterprise_id,
-            "enterprise_name": enterprise.name if enterprise else "",
-            "unit_price": o.unit_price,
-            "remaining_amount": round(o.remaining_amount, 2),
-            "filled_amount": round(o.filled_amount, 2)
-        })
-
-    buy_order_dicts = []
-    for o in all_buy_orders:
-        enterprise = get_enterprise(db, o.enterprise_id)
-        buy_order_dicts.append({
-            "id": o.id,
-            "enterprise_id": o.enterprise_id,
-            "enterprise_name": enterprise.name if enterprise else "",
-            "unit_price": o.unit_price,
-            "remaining_amount": round(o.remaining_amount, 2),
-            "filled_amount": round(o.filled_amount, 2)
-        })
-
-    match_results = match_orders_with_price(sell_order_dicts, buy_order_dicts)
-
-    transactions = []
     matched_order_info = []
-
-    base_timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
-
-    for i, mr in enumerate(match_results):
-        credit_amount = round(mr.credit_amount, 2)
-        matched_price = round(mr.matched_price, 2)
-        total_amount = round(mr.total_amount, 2)
-
-        txn_create = schemas.CreditTransactionCreate(
-            from_enterprise_id=mr.sell_enterprise_id,
-            to_enterprise_id=mr.buy_enterprise_id,
-            credit_amount=credit_amount,
-            unit_price=matched_price,
-            total_amount=total_amount,
-            remark=f"自动撮合：卖单ID{mr.sell_order_id} → 买单ID{mr.buy_order_id}"
-        )
-
-        db_txn = models.CreditTransaction(
-            **txn_create.model_dump(),
-            transaction_no=f"TXN{base_timestamp}{i+1:04d}",
-            sell_order_id=mr.sell_order_id,
-            buy_order_id=mr.buy_order_id,
-            status="completed"
-        )
-        db.add(db_txn)
-        transactions.append(db_txn)
-
-        sell_order = get_credit_order(db, mr.sell_order_id)
-        buy_order = get_credit_order(db, mr.buy_order_id)
-
-        if sell_order:
-            sell_order.filled_amount = round(sell_order.filled_amount + credit_amount, 2)
-            sell_order.remaining_amount = round(sell_order.remaining_amount - credit_amount, 2)
-            sell_order.status = OrderStatus.FILLED if sell_order.remaining_amount <= 0.01 else OrderStatus.PARTIAL
-            sell_order.updated_at = datetime.utcnow()
-
-        if buy_order:
-            buy_order.filled_amount = round(buy_order.filled_amount + credit_amount, 2)
-            buy_order.remaining_amount = round(buy_order.remaining_amount - credit_amount, 2)
-            buy_order.status = OrderStatus.FILLED if buy_order.remaining_amount <= 0.01 else OrderStatus.PARTIAL
-            buy_order.updated_at = datetime.utcnow()
-
-        create_price_history(db, db_txn, year)
-        update_annual_summary_after_transaction(db, db_txn, year)
-
+    for leg in db.query(models.CreditTradeLeg).filter(
+        models.CreditTradeLeg.execution_id == execution.id
+    ).order_by(models.CreditTradeLeg.seq).all():
+        sell_order = get_credit_order(db, leg.sell_order_id)
+        buy_order = get_credit_order(db, leg.buy_order_id)
+        sell_ent = get_enterprise(db, sell_order.enterprise_id) if sell_order else None
+        buy_ent = get_enterprise(db, buy_order.enterprise_id) if buy_order else None
         matched_order_info.append({
-            "sell_order_id": mr.sell_order_id,
-            "buy_order_id": mr.buy_order_id,
-            "sell_enterprise": mr.sell_enterprise_name,
-            "buy_enterprise": mr.buy_enterprise_name,
-            "credit_amount": credit_amount,
-            "matched_price": matched_price,
-            "total_amount": total_amount
+            "sell_order_id": leg.sell_order_id,
+            "buy_order_id": leg.buy_order_id,
+            "sell_enterprise": sell_ent.name if sell_ent else "",
+            "buy_enterprise": buy_ent.name if buy_ent else "",
+            "credit_amount": leg.credit_amount,
+            "matched_price": leg.matched_price,
+            "total_amount": leg.total_amount,
+            "leg_status": leg.status.value,
         })
 
-    db.commit()
+    remaining_surplus = sum(
+        o.remaining_amount for o in get_credit_orders(
+            db, year=year, order_type=OrderType.SELL,
+            status=None, limit=100000
+        ) if o.status in [OrderStatus.PENDING, OrderStatus.PARTIAL]
+    )
+    remaining_gap = sum(
+        o.remaining_amount for o in get_credit_orders(
+            db, year=year, order_type=OrderType.BUY,
+            status=None, limit=100000
+        ) if o.status in [OrderStatus.PENDING, OrderStatus.PARTIAL]
+    )
 
-    remaining_sell = sum(round(o["remaining_amount"], 2) for o in sell_order_dicts if o["remaining_amount"] > 0.01)
-    remaining_buy = sum(round(o["remaining_amount"], 2) for o in buy_order_dicts if o["remaining_amount"] > 0.01)
-
-    return transactions, matched_order_info, round(remaining_buy, 2), round(remaining_sell, 2)
+    return transactions, matched_order_info, round(remaining_gap, 2), round(remaining_surplus, 2)
 
 
 def create_price_history(
@@ -914,8 +900,9 @@ def get_price_trend(db: Session, year: int) -> schemas.PriceTrendResponse:
 def get_market_overview(db: Session, year: int) -> schemas.MarketOverviewResponse:
     all_sell_orders = get_credit_orders(db, year=year, order_type=OrderType.SELL, limit=10000)
     all_buy_orders = get_credit_orders(db, year=year, order_type=OrderType.BUY, limit=10000)
-    completed_txn = db.query(models.CreditTransaction).filter(
-        models.CreditTransaction.status == "completed"
+    # 已成交包含“已成交未清算(matched)”与“已清算(completed)”两阶段
+    all_matched_txn = db.query(models.CreditTransaction).filter(
+        models.CreditTransaction.status.in_(["completed", "matched"])
     ).all()
 
     pending_sell = [o for o in all_sell_orders if o.status in [OrderStatus.PENDING, OrderStatus.PARTIAL]]
@@ -938,9 +925,9 @@ def get_market_overview(db: Session, year: int) -> schemas.MarketOverviewRespons
         max_buy_price=round(max(buy_prices), 2) if buy_prices else 0.0,
         pending_sell_volume=round(sum(o.remaining_amount for o in pending_sell), 2),
         pending_buy_volume=round(sum(o.remaining_amount for o in pending_buy), 2),
-        matched_count=len(completed_txn),
-        matched_volume=round(sum(t.credit_amount for t in completed_txn), 2),
-        matched_value=round(sum(t.total_amount or 0 for t in completed_txn), 2)
+        matched_count=len(all_matched_txn),
+        matched_volume=round(sum(t.credit_amount for t in all_matched_txn), 2),
+        matched_value=round(sum(t.total_amount or 0 for t in all_matched_txn), 2)
     )
 
 

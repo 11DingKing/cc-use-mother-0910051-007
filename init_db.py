@@ -85,7 +85,7 @@ def init_database():
         for ent_id in enterprise_ids:
             crud.update_annual_summary_with_transactions(db, ent_id, year)
 
-    print("\n[6/10] 创建2025年度积分交易市场挂单...")
+    print("\n[6/10] 创建2025年度积分交易市场挂单（成交前预授权：批次/资金冻结）...")
     initial_orders = init_data.get_initial_market_orders(enterprise_ids, year=2025)
     created_orders = []
     for order_data in initial_orders:
@@ -99,6 +99,21 @@ def init_database():
             remark=order_data["remark"]
         )
         try:
+            if order_type == OrderType.SELL:
+                # 卖方先把可售积分钟余登记为批次（整批冻结，多批次可拆单）
+                crud.create_credit_batch(
+                    db,
+                    enterprise_id=order_data["enterprise_id"],
+                    year=order_data["year"],
+                    total_amount=order_data["total_amount"],
+                    remark=f"{order_data['remark']}-批次"
+                )
+            else:
+                # 买方先给资金账户入账，买单按价格上限冻结资金
+                crud.create_funds_account_if_absent(
+                    db, order_data["enterprise_id"],
+                    initial_balance=order_data["total_amount"] * 8000.0 + 1_000_000.0
+                )
             db_order = crud.create_credit_order(db, order_create)
             created_orders.append(db_order)
             order_type_str = "卖出" if order_type == OrderType.SELL else "买入"
