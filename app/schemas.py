@@ -157,6 +157,10 @@ class CreditTransaction(CreditTransactionBase):
     transaction_no: str
     transaction_date: datetime
     status: str
+    settled_amount: float = 0.0
+    settled_at: Optional[datetime] = None
+    settlement_no: Optional[str] = None
+    idempotency_key: Optional[str] = None
     created_at: datetime
 
     class Config:
@@ -283,6 +287,8 @@ class CreditOrder(CreditOrderBase):
     order_no: str
     filled_amount: float
     remaining_amount: float
+    frozen_amount: float = 0.0
+    released_amount: float = 0.0
     status: OrderStatus
     created_at: datetime
     updated_at: datetime
@@ -304,6 +310,10 @@ class CreditOrderMatchRequest(BaseModel):
     buy_order_id: int
     sell_order_id: int
     credit_amount: float
+    idempotency_key: Optional[str] = Field(
+        None, max_length=80,
+        description="客户端幂等键：相同键的并发/重试请求最终只产生一个成交结果"
+    )
 
 
 class MatchWithOrdersResponse(BaseModel):
@@ -516,3 +526,121 @@ class CarryoverSummaryResponse(BaseModel):
 
 
 CreditOrderWithDetail.model_rebuild()
+
+
+# ---------------------------------------------------------------------------
+# 成交前预授权 / 撮合任务 / 资金账户
+# ---------------------------------------------------------------------------
+
+class FundAccountBase(BaseModel):
+    enterprise_id: int
+    year: int
+
+
+class FundDepositRequest(BaseModel):
+    amount: float = Field(..., gt=0, description="授信/充值金额(元)")
+
+
+class FundAccount(BaseModel):
+    model_config = {"protected_namespaces": (), "from_attributes": True}
+
+    id: int
+    enterprise_id: int
+    year: int
+    balance: float
+    frozen_amount: float = 0.0
+    consumed_amount: float = 0.0
+    released_amount: float = 0.0
+    updated_at: Optional[datetime] = None
+
+
+class OrderAuthDetail(BaseModel):
+    auth_no: str
+    resource_type: str
+    status: str
+    frozen_amount: float
+    consumed_amount: float
+    released_amount: float
+    available_amount: float
+    expires_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class OrderAuth(OrderAuthDetail):
+    id: int
+    order_id: int
+    enterprise_id: int
+    year: int
+    frozen_fund: float = 0.0
+    consumed_fund: float = 0.0
+    released_fund: float = 0.0
+    frozen_at: Optional[datetime] = None
+    consumed_at: Optional[datetime] = None
+    released_at: Optional[datetime] = None
+    remark: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class OrderQuantityView(BaseModel):
+    """挂单/预授权/成交/清算/释放数量五分开的查询视图"""
+    model_config = {"protected_namespaces": ()}
+
+    order_id: int
+    order_no: str
+    order_type: str
+    status: str
+    unit_price: float
+    posted_amount: float = Field(..., description="挂单数量")
+    filled_amount: float = Field(..., description="已成交数量")
+    remaining_amount: float = Field(..., description="挂单剩余数量")
+    released_amount: float = Field(..., description="撤单/过期释放数量")
+    auth: dict
+    matched_amount: float = Field(..., description="成交数量")
+    cleared_amount: float = Field(..., description="已清算数量")
+    uncleared_amount: float = Field(..., description="成交未清算数量")
+    transaction_count: int
+
+
+class MatchTaskItemView(BaseModel):
+    seq: int
+    sell_order_id: int
+    buy_order_id: int
+    credit_amount: float
+    matched_price: float
+    total_amount: float
+    status: str
+    transaction_id: Optional[int] = None
+    error_detail: Optional[str] = None
+
+
+class MatchTaskView(BaseModel):
+    """撮合任务：含确定顺序与可恢复的部分结果"""
+    model_config = {"protected_namespaces": ()}
+
+    task_id: int
+    task_no: str
+    idempotency_key: Optional[str] = None
+    year: int
+    task_type: str
+    status: str
+    total_items: int
+    completed_items: int
+    total_credit_amount: float
+    completed_credit_amount: float
+    error_detail: Optional[str] = None
+    created_at: Optional[datetime] = None
+    finished_at: Optional[datetime] = None
+    items: List[MatchTaskItemView] = []
+
+
+class PreAuthMatchResponse(BaseModel):
+    success: bool
+    message: str
+    idempotent_hit: bool = Field(False, description="是否命中并发重复请求的既有结果")
+    task: Optional[MatchTaskView] = None
+    transactions: List[CreditTransactionWithDetail] = []
+    partial: bool = False

@@ -4,8 +4,8 @@ import os
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from app.database import Base, engine, SessionLocal
-from app import crud, schemas, init_data
-from app.models import CreditRecordStatus, OrderType
+from app import crud, schemas, init_data, matching
+from app.models import CreditRecordStatus, OrderType, CreditTransaction
 
 
 def init_database():
@@ -85,11 +85,15 @@ def init_database():
         for ent_id in enterprise_ids:
             crud.update_annual_summary_with_transactions(db, ent_id, year)
 
-    print("\n[6/10] 创建2025年度积分交易市场挂单...")
+    print("\n[6/10] 创建2025年度积分交易市场挂单（成交前预授权：买单先授信、挂单即冻结）...")
     initial_orders = init_data.get_initial_market_orders(enterprise_ids, year=2025)
     created_orders = []
     for order_data in initial_orders:
         order_type = OrderType.SELL if order_data["order_type"] == "sell" else OrderType.BUY
+        if order_type == OrderType.BUY:
+            # 买方资金账户授信：按挂单量×报价足额授信，挂单时冻结
+            credit_limit = round(order_data["total_amount"] * order_data["unit_price"] * 1.2, 2)
+            matching.deposit_fund(db, order_data["enterprise_id"], order_data["year"], credit_limit)
         order_create = schemas.CreditOrderCreate(
             enterprise_id=order_data["enterprise_id"],
             year=order_data["year"],
@@ -99,34 +103,62 @@ def init_database():
             remark=order_data["remark"]
         )
         try:
-            db_order = crud.create_credit_order(db, order_create)
+            db_order, auth_err = matching.create_order_with_auth(db, order_create)
+            if auth_err:
+                print(f"  ✗ 创建挂单失败: {auth_err}")
+                continue
             created_orders.append(db_order)
             order_type_str = "卖出" if order_type == OrderType.SELL else "买入"
             print(f"  ✓ {db_order.enterprise.name} {order_type_str}: "
                   f"{db_order.total_amount:,.0f} 分 @ {db_order.unit_price:,.0f} 元/分 "
-                  f"(订单号: {db_order.order_no})")
+                  f"(订单号: {db_order.order_no}，已预授权冻结)")
         except ValueError as e:
             print(f"  ✗ 创建挂单失败: {e}")
-    print(f"✓ 共创建 {len(created_orders)} 个初始挂单")
+    print(f"✓ 共创建 {len(created_orders)} 个初始挂单（均带有效预授权）")
 
-    print("\n[7/10] 执行挂单撮合交易（按价格匹配）...")
-    transactions, matched_orders, remaining_gap, remaining_surplus = crud.match_all_pending_orders(
-        db, year=2025
-    )
-
-    if transactions:
-        total_amount = sum(t.total_amount for t in transactions if t.total_amount)
-        print(f"  ✓ 完成 {len(transactions)} 笔挂单撮合交易")
-        for i, (txn, info) in enumerate(zip(transactions, matched_orders), 1):
-            print(f"    {i}. {info['sell_enterprise']} → {info['buy_enterprise']}: "
-                  f"{info['credit_amount']:,.2f} 分 @ {info['matched_price']:,.0f} 元/分, "
-                  f"金额: {info['total_amount']:,.0f} 元")
-        print(f"  交易总金额: {total_amount:,.0f} 元")
+    print("\n[7/10] 执行挂单撮合交易（只消费有效授权，价格优先/时间优先）...")
+    task, existing, match_err = matching.run_auto_match(db, year=2025)
+    if match_err and task is None:
+        print(f"  ✓ {match_err}")
+        matched_orders = []
+        transactions = []
+        remaining_gap, remaining_surplus = 0.0, 0.0
     else:
-        print("  ✓ 无匹配的挂单（价格不匹配或数量不足）")
+        target = task or existing
+        view = matching.task_view(target)
+        transactions = [
+            db.get(CreditTransaction, it["transaction_id"])
+            for it in view["items"] if it["status"] == "succeeded" and it["transaction_id"]
+        ]
+        matched_orders = view["items"]
 
-    print(f"  剩余待买量: {remaining_gap:,.2f} 分")
-    print(f"  剩余待卖量: {remaining_surplus:,.2f} 分")
+        if transactions:
+            total_amount = sum(t.total_amount for t in transactions if t.total_amount)
+            print(f"  ✓ 任务 {target.task_no} 状态={target.status.value}，完成 {len(transactions)} 笔撮合且已清算")
+            for i, info in enumerate(matched_orders, 1):
+                if info["status"] != "succeeded":
+                    continue
+                print(
+                    f"    卖单{info['sell_order_id']} → 买单{info['buy_order_id']}: "
+                    f"{info['credit_amount']:,.2f} 分 @ {info['matched_price']:,.0f} 元/分, "
+                    f"金额: {info['total_amount']:,.0f} 元 [{info['status']}]"
+                )
+            print(f"  交易总金额: {total_amount:,.0f} 元")
+        else:
+            print("  ✓ 无落账成交")
+
+        remain_sell = sum(
+            matching.order_quantity_view(db, o.id)["auth"]["available_amount"]
+            for o in created_orders if o.order_type == OrderType.SELL
+        )
+        remain_buy = sum(
+            matching.order_quantity_view(db, o.id)["auth"]["available_amount"]
+            for o in created_orders if o.order_type == OrderType.BUY
+        )
+        remaining_gap, remaining_surplus = round(remain_buy, 2), round(remain_sell, 2)
+
+    print(f"  剩余待买授权量: {remaining_gap:,.2f} 分")
+    print(f"  剩余待卖授权量: {remaining_surplus:,.2f} 分")
 
     for year in years:
         for ent_id in enterprise_ids:
